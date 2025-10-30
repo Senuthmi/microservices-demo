@@ -3,7 +3,7 @@ set -e
 
 # Update and install dependencies
 sudo apt update -y
-sudo apt install unzip wget curl gnupg apt-transport-https openjdk-17-jdk postgresql postgresql-contrib -y
+sudo apt install -y unzip wget curl gnupg apt-transport-https openjdk-17-jdk postgresql postgresql-contrib
 
 # Configure PostgreSQL
 sudo -u postgres psql <<EOF
@@ -12,12 +12,17 @@ CREATE USER sonar WITH ENCRYPTED PASSWORD 'StrongPassword123!';
 GRANT ALL PRIVILEGES ON DATABASE sonarqube TO sonar;
 EOF
 
-# Download SonarQube
+# Download and extract SonarQube
 cd /opt
-sudo wget https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-10.3.0.82913.zip
-sudo unzip sonarqube-10.3.0.82913.zip
+sudo wget -q https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-10.3.0.82913.zip
+sudo unzip -q sonarqube-10.3.0.82913.zip
 sudo mv sonarqube-10.3.0.82913 sonarqube
-sudo chown -R $USER:$USER /opt/sonarqube
+
+# Create dedicated user
+if ! id "sonarqube" &>/dev/null; then
+  sudo useradd -r -s /bin/bash sonarqube
+fi
+sudo chown -R sonarqube:sonarqube /opt/sonarqube
 
 # Configure sonar.properties
 sudo sed -i 's|#sonar.jdbc.username=.*|sonar.jdbc.username=sonar|' /opt/sonarqube/conf/sonar.properties
@@ -26,7 +31,7 @@ sudo sed -i 's|#sonar.jdbc.url=.*|sonar.jdbc.url=jdbc:postgresql://localhost/son
 sudo sed -i 's|#sonar.web.host=.*|sonar.web.host=0.0.0.0|' /opt/sonarqube/conf/sonar.properties
 
 # Create SonarQube systemd service
-sudo tee /etc/systemd/system/sonar.service > /dev/null <<EOL
+sudo tee /etc/systemd/system/sonar.service > /dev/null <<'EOL'
 [Unit]
 Description=SonarQube service
 After=syslog.target network.target
@@ -35,8 +40,8 @@ After=syslog.target network.target
 Type=forking
 ExecStart=/opt/sonarqube/bin/linux-x86-64/sonar.sh start
 ExecStop=/opt/sonarqube/bin/linux-x86-64/sonar.sh stop
-User=$USER
-Group=$USER
+User=sonarqube
+Group=sonarqube
 Restart=always
 LimitNOFILE=65536
 LimitNPROC=4096
@@ -45,7 +50,10 @@ LimitNPROC=4096
 WantedBy=multi-user.target
 EOL
 
-# Start SonarQube service
+# Start and enable service
 sudo systemctl daemon-reload
 sudo systemctl enable sonar
 sudo systemctl start sonar
+
+echo "✅ SonarQube installation completed successfully."
+
