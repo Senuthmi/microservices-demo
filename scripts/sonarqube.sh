@@ -1,40 +1,89 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Update and install dependencies
-sudo apt update -y
-sudo apt install -y unzip wget curl gnupg apt-transport-https openjdk-17-jdk postgresql postgresql-contrib
+SONAR_VERSION="10.3.0.82913"
+SONAR_DIR="/opt/sonarqube"
+SONAR_ZIP="sonarqube-${SONAR_VERSION}.zip"
+SONAR_URL="https://binaries.sonarsource.com/Distribution/sonarqube/${SONAR_ZIP}"
+DB_NAME="sonarqube"
+DB_USER="sonar"
+DB_PASS="StrongPassword123!"
 
-# Configure PostgreSQL
+# Ensure noninteractive apt
+export DEBIAN_FRONTEND=noninteractive
+
+echo "[+] Installing dependencies"
+apt-get update -y
+apt-get install -y unzip wget curl gnupg apt-transport-https openjdk-17-jdk postgresql postgresql-contrib
+
+echo "[+] Ensuring PostgreSQL is running"
+systemctl enable --now postgresql
+
+echo "[+] Configuring PostgreSQL database and user"
 sudo -u postgres psql <<EOF
-CREATE DATABASE sonarqube;
-CREATE USER sonar WITH ENCRYPTED PASSWORD 'StrongPassword123!';
-GRANT ALL PRIVILEGES ON DATABASE sonarqube TO sonar;
+DO
+\$do\$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}') THEN
+      PERFORM dblink_exec('dbname=postgres', 'CREATE DATABASE ${DB_NAME}');
+   END IF;
+END
+\$do\$;
+
+DO
+\$do\$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DB_USER}') THEN
+      CREATE ROLE ${DB_USER} LOGIN PASSWORD '${DB_PASS}';
+   ELSE
+      PERFORM 1;
+   END IF;
+END
+\$do\$;
+
+GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
 EOF
 
-# Download and extract SonarQube
-cd /opt
-sudo wget -q https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-10.3.0.82913.zip
-sudo unzip -q sonarqube-10.3.0.82913.zip
-sudo mv sonarqube-10.3.0.82913 sonarqube
+echo "[+] Setting kernel parameter vm.max_map_count"
+sysctl -w vm.max_map_count=262144
+grep -q "vm.max_map_count" /etc/sysctl.conf || echo "vm.max_map_count=262144" >> /etc/sysctl.conf
 
-# Create dedicated user
-if ! id "sonarqube" &>/dev/null; then
-  sudo useradd -r -s /bin/bash sonarqube
+echo "[+] Downloading SonarQube if needed"
+mkdir -p /opt
+if [ ! -d "${SONAR_DIR}" ]; then
+  cd /opt
+  if [ ! -f "${SONAR_ZIP}" ]; then
+    wget -q "${SONAR_URL}"
+  fi
+  unzip -q "${SONAR_ZIP}"
+  mv "sonarqube-${SONAR_VERSION}" "${SONAR_DIR}"
 fi
-sudo chown -R sonarqube:sonarqube /opt/sonarqube
 
-# Configure sonar.properties
-sudo sed -i 's|#sonar.jdbc.username=.*|sonar.jdbc.username=sonar|' /opt/sonarqube/conf/sonar.properties
-sudo sed -i 's|#sonar.jdbc.password=.*|sonar.jdbc.password=StrongPassword123!|' /opt/sonarqube/conf/sonar.properties
-sudo sed -i 's|#sonar.jdbc.url=.*|sonar.jdbc.url=jdbc:postgresql://localhost/sonarqube|' /opt/sonarqube/conf/sonar.properties
-sudo sed -i 's|#sonar.web.host=.*|sonar.web.host=0.0.0.0|' /opt/sonarqube/conf/sonar.properties
+echo "[+] Creating sonarqube system user and setting ownership"
+if ! id "sonarqube" >/dev/null 2>&1; then
+  useradd --system --home-dir "${SONAR_DIR}" --shell /bin/bash sonarqube
+fi
+mkdir -p "${SONAR_DIR}/"{logs,data,temp,extensions}
+chown -R sonarqube:sonarqube "${SONAR_DIR}"
 
-# Create SonarQube systemd service
-sudo tee /etc/systemd/system/sonar.service > /dev/null <<'EOL'
+echo "[+] Configuring sonar.properties (DB, bind address, port)"
+sed -i 's|^#\?sonar.jdbc.username=.*|sonar.jdbc.username='"${DB_USER}"'|' "${SONAR_DIR}/conf/sonar.properties"
+sed -i 's|^#\?sonar.jdbc.password=.*|sonar.jdbc.password='"${DB_PASS}"'|' "${SONAR_DIR}/conf/sonar.properties"
+sed -i 's|^#\?sonar.jdbc.url=.*|sonar.jdbc.url=jdbc:postgresql://localhost/'"${DB_NAME}"'|' "${SONAR_DIR}/conf/sonar.properties"
+sed -i 's|^#\?sonar.web.host=.*|sonar.web.host=0.0.0.0|' "${SONAR_DIR}/conf/sonar.properties"
+sed -i 's|^#\?sonar.web.port=.*|sonar.web.port=9000|' "${SONAR_DIR}/conf/sonar.properties"
+
+echo "[+] Ensuring sonar.sh drops privileges"
+if [ -f "${SONAR_DIR}/bin/linux-x86-64/sonar.sh" ]; then
+  sed -i 's/^#\?RUN_AS_USER=.*/RUN_AS_USER=sonarqube/' "${SONAR_DIR}/bin/linux-x86-64/sonar.sh"
+fi
+
+echo "[+] Creating systemd unit"
+tee /etc/systemd/system/sonar.service >/dev/null <<'EOL'
 [Unit]
 Description=SonarQube service
-After=syslog.target network.target
+After=syslog.target network.target postgresql.service
+Wants=postgresql.service
 
 [Service]
 Type=forking
@@ -45,15 +94,22 @@ Group=sonarqube
 Restart=always
 LimitNOFILE=65536
 LimitNPROC=4096
+# Ensure Java 17 is available in PATH
+Environment="JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64"
+Environment="PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 [Install]
 WantedBy=multi-user.target
 EOL
 
-# Start and enable service
-sudo systemctl daemon-reload
-sudo systemctl enable sonar
-sudo systemctl start sonar
+echo "[+] Enabling and starting SonarQube"
+systemctl daemon-reload
+systemctl enable sonar
+systemctl restart sonar
 
-echo "✅ SonarQube installation completed successfully."
+echo "[+] Optionally allow port 9000 via UFW if active"
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+  ufw allow 9000/tcp || true
+fi
 
+echo "[✓] SonarQube installation completed. It may take 1–3 minutes to become operational."
